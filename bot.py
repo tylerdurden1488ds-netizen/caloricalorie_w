@@ -1,5 +1,7 @@
 import os
+import re
 import logging
+import asyncio
 from datetime import date
 from io import BytesIO
 
@@ -9,13 +11,20 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
-import asyncio
 
 from google import genai
 from google.genai import types as genai_types
 
 # ── Логирование ──────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+os.makedirs("/app/data", exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("/app/data/bot.log", encoding="utf-8"),
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # ── Переменные окружения ──────────────────────────────────────────────────────
@@ -30,7 +39,6 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 GEMINI_MODEL = "gemini-2.5-flash"
 
 # ── База данных в памяти ──────────────────────────────────────────────────────
-# user_id -> { daily_norm, remaining, last_date, weight, height, age, goal_weight }
 user_db: dict[int, dict] = {}
 
 # ── FSM состояния ─────────────────────────────────────────────────────────────
@@ -40,9 +48,8 @@ class Survey(StatesGroup):
     age = State()
     goal_weight = State()
 
-# ── Формула Миффлина-Сан Жеора (усреднённая, без пола) ───────────────────────
+# ── Формула Миффлина-Сан Жеора ────────────────────────────────────────────────
 def calc_daily_norm(weight: float, height: float, age: int) -> int:
-    """Базовый обмен × 1.4 (умеренная активность), без учёта пола."""
     bmr = 10 * weight + 6.25 * height - 5 * age
     return round(bmr * 1.4)
 
@@ -58,19 +65,17 @@ def refresh_daily_remaining(user_id: int) -> None:
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# /start — начало анкеты
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "👋 Привет! Я помогу считать калории по фото еды.\n\n"
-        "Сначала заполним небольшую анкету, чтобы рассчитать твою суточную норму.\n\n"
+        "Сначала заполним небольшую анкету.\n\n"
         "⚖️ Введи свой текущий вес (кг), например: <b>75</b>",
         parse_mode="HTML",
     )
     await state.set_state(Survey.weight)
 
-# Шаг 1 — вес
 @dp.message(Survey.weight)
 async def survey_weight(message: Message, state: FSMContext) -> None:
     try:
@@ -84,7 +89,6 @@ async def survey_weight(message: Message, state: FSMContext) -> None:
     await message.answer("📏 Введи свой рост (см), например: <b>175</b>", parse_mode="HTML")
     await state.set_state(Survey.height)
 
-# Шаг 2 — рост
 @dp.message(Survey.height)
 async def survey_height(message: Message, state: FSMContext) -> None:
     try:
@@ -98,7 +102,6 @@ async def survey_height(message: Message, state: FSMContext) -> None:
     await message.answer("🎂 Введи свой возраст (лет), например: <b>30</b>", parse_mode="HTML")
     await state.set_state(Survey.age)
 
-# Шаг 3 — возраст
 @dp.message(Survey.age)
 async def survey_age(message: Message, state: FSMContext) -> None:
     try:
@@ -112,7 +115,6 @@ async def survey_age(message: Message, state: FSMContext) -> None:
     await message.answer("🎯 Введи целевой вес (кг), например: <b>68</b>", parse_mode="HTML")
     await state.set_state(Survey.goal_weight)
 
-# Шаг 4 — целевой вес → сохраняем профиль
 @dp.message(Survey.goal_weight)
 async def survey_goal_weight(message: Message, state: FSMContext) -> None:
     try:
@@ -147,35 +149,32 @@ async def survey_goal_weight(message: Message, state: FSMContext) -> None:
         f"📏 Рост: {height} см\n"
         f"🎂 Возраст: {age} лет\n"
         f"🎯 Цель: {goal_weight} кг\n\n"
-        f"🔥 Твоя суточная норма калорий: <b>{daily_norm} ккал</b>\n\n"
-        f"Теперь просто отправляй фото еды — я посчитаю калории! 📸",
+        f"🔥 Твоя суточная норма: <b>{daily_norm} ккал</b>\n\n"
+        f"Теперь отправляй фото еды — я посчитаю калории! 📸",
         parse_mode="HTML",
     )
 
-# Фото — основной сценарий
 @dp.message(F.photo)
 async def handle_photo(message: Message) -> None:
     user_id = message.from_user.id
 
-    # Проверяем, заполнена ли анкета
     if user_id not in user_db:
-        await message.answer(
-            "👋 Сначала пройди короткую анкету — напишите /start"
-        )
+        await message.answer("👋 Сначала пройди анкету — напиши /start")
         return
 
-    # Сбрасываем остаток при новом дне
     refresh_daily_remaining(user_id)
-
     await message.answer("🔍 Анализирую фото, подожди секунду...")
 
     try:
-        # Скачиваем фото (берём наибольшее разрешение)
+        # Скачиваем фото
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
+        logger.info("Скачиваю файл: %s", file.file_path)
+
         file_bytes_io = BytesIO()
         await bot.download_file(file.file_path, destination=file_bytes_io)
         image_bytes = file_bytes_io.getvalue()
+        logger.info("Фото скачано, размер: %d байт", len(image_bytes))
 
         # Отправляем в Gemini
         prompt = (
@@ -184,6 +183,7 @@ async def handle_photo(message: Message) -> None:
             "Название - ХХХ ккал. Будь максимально лаконичен, без лишнего текста."
         )
 
+        logger.info("Отправляю запрос в Gemini...")
         response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=[
@@ -193,10 +193,9 @@ async def handle_photo(message: Message) -> None:
         )
 
         gemini_text = response.text.strip()
-        logger.info("Gemini ответ для user %s: %s", user_id, gemini_text)
+        logger.info("Gemini ответ: %s", gemini_text)
 
-        # Парсим калории — ищем любое число рядом со словом ккал/cal/калор
-        import re
+        # Парсим калории
         calories_eaten = None
         food_name = gemini_text
 
@@ -211,20 +210,21 @@ async def handle_photo(message: Message) -> None:
             except Exception:
                 pass
 
-        # Попытка 2: найти любое число перед/после ккал в тексте
+        # Попытка 2: найти число рядом со словом ккал
         if calories_eaten is None:
             numbers = re.findall(r'(\d+)\s*(?:ккал|kal|cal|калор)', gemini_text, re.IGNORECASE)
             if numbers:
                 calories_eaten = int(numbers[0])
-                # Имя — первая строка или всё до числа
                 food_name = gemini_text.split('\n')[0].strip()
 
-        # Попытка 3: просто первое число в тексте >= 50
+        # Попытка 3: первое число >= 50
         if calories_eaten is None:
             all_numbers = [int(n) for n in re.findall(r'\d+', gemini_text) if int(n) >= 50]
             if all_numbers:
                 calories_eaten = all_numbers[0]
                 food_name = gemini_text.split('\n')[0].strip()
+
+        logger.info("Распознано: %s = %s ккал", food_name, calories_eaten)
 
         if calories_eaten is None:
             await message.answer(
@@ -234,7 +234,6 @@ async def handle_photo(message: Message) -> None:
             )
             return
 
-        # Обновляем остаток
         data = user_db[user_id]
         data["remaining"] -= calories_eaten
         remaining = data["remaining"]
@@ -244,7 +243,7 @@ async def handle_photo(message: Message) -> None:
             status_line = f"✅ Осталось на сегодня: <b>{remaining} ккал</b>"
         else:
             over = abs(remaining)
-            status_line = f"⚠️ Суточная норма превышена на <b>{over} ккал</b>!"
+            status_line = f"⚠️ Норма превышена на <b>{over} ккал</b>!"
 
         await message.answer(
             f"🍽 <b>{food_name}</b>\n"
@@ -255,23 +254,22 @@ async def handle_photo(message: Message) -> None:
         )
 
     except Exception as e:
-        logger.exception("Ошибка при обработке фото для user %s", user_id)
+        logger.exception("Ошибка при обработке фото для user %s: %s", user_id, str(e))
         await message.answer(
-            "❌ Произошла ошибка при анализе фото. Попробуй ещё раз или пришли другое фото."
+            f"❌ Ошибка: <code>{str(e)[:200]}</code>\n\nПопробуй ещё раз.",
+            parse_mode="HTML",
         )
 
-# Текстовое сообщение вне FSM — подсказка
 @dp.message(F.text)
 async def handle_text(message: Message, state: FSMContext) -> None:
     current_state = await state.get_state()
     if current_state is not None:
-        return  # FSM сам обработает
+        return
     await message.answer(
         "📸 Отправь фото еды, чтобы посчитать калории.\n"
         "Или /start, чтобы заново заполнить анкету."
     )
 
-# ── Запуск ────────────────────────────────────────────────────────────────────
 async def main() -> None:
     logger.info("Бот запущен")
     await dp.start_polling(bot)
