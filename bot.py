@@ -35,7 +35,10 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     raise RuntimeError("Не заданы переменные окружения TELEGRAM_TOKEN и/или GEMINI_API_KEY")
 
 # ── Gemini клиент ─────────────────────────────────────────────────────────────
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options={"headers": {"x-goog-user-project": ""}},
+)
 GEMINI_MODEL = "gemini-2.5-flash"
 
 # ── База данных в памяти ──────────────────────────────────────────────────────
