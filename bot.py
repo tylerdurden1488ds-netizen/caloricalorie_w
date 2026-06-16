@@ -195,25 +195,41 @@ async def handle_photo(message: Message) -> None:
         gemini_text = response.text.strip()
         logger.info("Gemini ответ для user %s: %s", user_id, gemini_text)
 
-        # Парсим калории из ответа вида "Название - ХХХ ккал"
+        # Парсим калории — ищем любое число рядом со словом ккал/cal/калор
+        import re
         calories_eaten = None
         food_name = gemini_text
 
-        if " - " in gemini_text and "ккал" in gemini_text.lower():
+        # Попытка 1: формат "Название - ХХХ ккал"
+        if " - " in gemini_text:
             try:
                 parts = gemini_text.split(" - ", 1)
                 food_name = parts[0].strip()
-                cal_part = parts[1].lower().replace("ккал", "").strip()
-                calories_eaten = int("".join(filter(str.isdigit, cal_part)))
+                numbers = re.findall(r'\d+', parts[1])
+                if numbers:
+                    calories_eaten = int(numbers[0])
             except Exception:
-                calories_eaten = None
+                pass
+
+        # Попытка 2: найти любое число перед/после ккал в тексте
+        if calories_eaten is None:
+            numbers = re.findall(r'(\d+)\s*(?:ккал|kal|cal|калор)', gemini_text, re.IGNORECASE)
+            if numbers:
+                calories_eaten = int(numbers[0])
+                # Имя — первая строка или всё до числа
+                food_name = gemini_text.split('\n')[0].strip()
+
+        # Попытка 3: просто первое число в тексте >= 50
+        if calories_eaten is None:
+            all_numbers = [int(n) for n in re.findall(r'\d+', gemini_text) if int(n) >= 50]
+            if all_numbers:
+                calories_eaten = all_numbers[0]
+                food_name = gemini_text.split('\n')[0].strip()
 
         if calories_eaten is None:
-            # Если не удалось распарсить — показываем ответ Gemini как есть
             await message.answer(
                 f"🍽 Gemini ответил:\n<i>{gemini_text}</i>\n\n"
-                "⚠️ Не удалось автоматически вычесть калории. "
-                "Попробуй отправить более чёткое фото.",
+                "⚠️ Не удалось распознать калории. Попробуй другое фото.",
                 parse_mode="HTML",
             )
             return
